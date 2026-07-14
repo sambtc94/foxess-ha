@@ -83,15 +83,17 @@ CONF_V1_API = "Use_V1_Api"
 CONF_EVO = "Evo"
 CONF_REFRESH_INTERVAL = "refreshInterval"
 RETRY_NEXT_SLOT = -1
-RETRY_IN_5_MINS = 25
 DNS_ERROR = 101
 
 DEFAULT_NAME = "FoxESS"
 DEFAULT_VERIFY_SSL = False  # True
 DEFAULT_USE_V1_API = True
 
-SCAN_MINUTES = 1  # number of minutes betwen API requests
+SCAN_MINUTES = 5  # default interval in minutes between API requests
 SCAN_INTERVAL = timedelta(minutes=SCAN_MINUTES)
+# Cycle length in ticks before resetting to tslice=0 (battery settings + daily gen refresh).
+# At the default 5-min interval: 12 ticks × 5 min = 60-minute cycle.
+TICK_CYCLE_LENGTH = 11
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {
@@ -107,7 +109,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_V1_API): cv.boolean,
         vol.Optional(CONF_EVO): cv.boolean,
         vol.Optional(CONF_REFRESH_INTERVAL, default=SCAN_MINUTES): vol.All(
-            vol.Coerce(int), vol.Range(min=1, max=60)
+            vol.Coerce(int), vol.Range(min=1, max=30)
         ),
     }
 )
@@ -189,134 +191,108 @@ class FoxESSCoordinator(DataUpdateCoordinator):
         allData = self._all_data
         _LOGGER.debug("Updating data from https://www.foxesscloud.com/")
         hournow = datetime.now().strftime("%H")
-        _LOGGER.debug("Time now: %s, last %s", hournow, self._last_hour)
         tslice = self._timeslice + 1
         self._timeslice = tslice
 
-        if tslice % 5 == 0:
-            _LOGGER.debug("Main Poll, interval: %s, %s", self.device_sn, self._timeslice)
-            geterror = False
-            if tslice % 15 == 0:
-                if self.evo:
-                    geterror = await getOADeviceList(
-                        self.hass, allData, self.device_sn, self.api_key, coordinator=self
-                    )
-                else:
-                    geterror = await getOADeviceDetail(
-                        self.hass, allData, self.device_sn, self.api_key, coordinator=self
-                    )
-                await asyncio.sleep(1)
+        _LOGGER.debug("Poll tick: %s, tslice %s", self.device_sn, tslice)
+        geterror = False
 
-            if not geterror:
-                if allData["addressbook"]["status"] is not None:
-                    statetest = int(allData["addressbook"]["status"])
-                    if statetest in [3]:
-                        allData["raw"]["runningState"] = "164"
-                else:
-                    statetest = 0
-                _LOGGER.debug(" Statetest %s", statetest)
-                if statetest in [1, 2]:
-                    allData["online"] = True
-                    if tslice == 0:
-                        await getOABatterySettings(
-                            self.hass, allData, self.device_sn, self.api_key, coordinator=self
-                        )
-                        await asyncio.sleep(1)
-                    geterror = await getRaw(
-                        self.hass, allData, self.api_key, self.device_sn, coordinator=self
-                    )
-                    if not geterror:
-                        if tslice % 15 == 0:
-                            await asyncio.sleep(1)
-                            geterror = await getReport(
-                                self.hass, allData, self.api_key, self.device_sn, coordinator=self
-                            )
-                            if not geterror:
-                                await asyncio.sleep(1)
-                                work_mode_error = await getWorkMode(
-                                    self.hass, allData, self.device_sn, self.api_key, coordinator=self
-                                )
-                                if work_mode_error:
-                                    _LOGGER.debug("getWorkMode False")
-                                if tslice == 0:
-                                    await asyncio.sleep(1)
-                                    geterror = await getReportDailyGeneration(
-                                        self.hass,
-                                        allData,
-                                        self.api_key,
-                                        self.device_sn,
-                                        coordinator=self,
-                                    )
-                                    if geterror:
-                                        _LOGGER.debug("getReportDailyGeneration False")
-                            else:
-                                _LOGGER.debug("getReport False")
-                            if geterror:
-                                geterror = False
-                                allData["online"] = False
-                                tslice = RETRY_IN_5_MINS
-                    else:
-                        _LOGGER.debug("get variables failed")
-                        if statetest == 2:
-                            _LOGGER.debug(
-                                "Inverter in alarm, slowing retry response for SN: %s",
-                                self.device_sn,
-                            )
-                            allData["online"] = False
-                            tslice = RETRY_IN_5_MINS
-                        else:
-                            if geterror == DNS_ERROR:
-                                _LOGGER.warning("Fox Cloud - DNS fail, retry in 1 minute")
-                                if tslice != 0:
-                                    tslice = tslice - 1
-                                else:
-                                    tslice = RETRY_NEXT_SLOT
-                            else:
-                                _LOGGER.debug(
-                                    "slowing retry response for SN: %s", self.device_sn
-                                )
-                                allData["online"] = False
-                                tslice = RETRY_IN_5_MINS
-                        geterror = False
-                else:
-                    if statetest == 3:
-                        allData["online"] = False
-                        tslice = RETRY_IN_5_MINS
-                        _LOGGER.debug("Inverter off-line for SN: %s", self.device_sn)
-
-                if not allData["online"]:
-                    if not geterror:
-                        _LOGGER.warning(
-                            "%s Inverter is off-line, waiting to retry", self.name_prefix
-                        )
-                    else:
-                        _LOGGER.warning(
-                            "%s Cloud timeout, retry in 1 minute", self.name_prefix
-                        )
-            else:
-                _LOGGER.warning(
-                    "%s Cloud timeout on Device Detail, retry in 1 minute.",
-                    self.name_prefix,
+        # Refresh device detail every 3 ticks (~15 min at the default 5-min interval).
+        # tslice==0 also satisfies % 3, so device detail is always fetched on startup.
+        if tslice % 3 == 0:
+            if self.evo:
+                geterror = await getOADeviceList(
+                    self.hass, allData, self.device_sn, self.api_key, coordinator=self
                 )
+            else:
+                geterror = await getOADeviceDetail(
+                    self.hass, allData, self.device_sn, self.api_key, coordinator=self
+                )
+            await asyncio.sleep(1)
 
-            if geterror is not False:
-                allData["online"] = False
-                if tslice != 0:
-                    tslice = tslice - 1
+        if not geterror:
+            if allData["addressbook"]["status"] is not None:
+                statetest = int(allData["addressbook"]["status"])
+                if statetest in [3]:
+                    allData["raw"]["runningState"] = "164"
+            else:
+                statetest = 0
+            _LOGGER.debug("Statetest %s", statetest)
+
+            if statetest in [1, 2]:
+                allData["online"] = True
+                # Battery settings and daily generation are slow-changing; refresh once per cycle.
+                if tslice == 0:
+                    await getOABatterySettings(
+                        self.hass, allData, self.device_sn, self.api_key, coordinator=self
+                    )
+                    await asyncio.sleep(1)
+                geterror = await getRaw(
+                    self.hass, allData, self.api_key, self.device_sn, coordinator=self
+                )
+                if not geterror:
+                    if tslice % 3 == 0:
+                        await asyncio.sleep(1)
+                        geterror = await getReport(
+                            self.hass, allData, self.api_key, self.device_sn, coordinator=self
+                        )
+                        if not geterror:
+                            await asyncio.sleep(1)
+                            work_mode_error = await getWorkMode(
+                                self.hass, allData, self.device_sn, self.api_key, coordinator=self
+                            )
+                            if work_mode_error:
+                                _LOGGER.debug("getWorkMode returned error")
+                            if tslice == 0:
+                                await asyncio.sleep(1)
+                                geterror = await getReportDailyGeneration(
+                                    self.hass,
+                                    allData,
+                                    self.api_key,
+                                    self.device_sn,
+                                    coordinator=self,
+                                )
+                                if geterror:
+                                    _LOGGER.debug("getReportDailyGeneration returned error")
+                        else:
+                            _LOGGER.debug("getReport returned error")
+                        if geterror:
+                            geterror = False
+                            allData["online"] = False
                 else:
-                    tslice = RETRY_NEXT_SLOT
+                    _LOGGER.debug("getRaw failed for SN: %s", self.device_sn)
+                    if statetest == 2:
+                        _LOGGER.debug("Inverter in alarm state for SN: %s", self.device_sn)
+                        allData["online"] = False
+                    else:
+                        if geterror == DNS_ERROR:
+                            _LOGGER.warning("Fox Cloud - DNS failure, will retry next poll")
+                        else:
+                            allData["online"] = False
+                    geterror = False
+            else:
+                if statetest == 3:
+                    allData["online"] = False
+                    _LOGGER.debug("Inverter off-line for SN: %s", self.device_sn)
 
-        if tslice >= 59:
+            if not allData["online"]:
+                _LOGGER.warning("%s Inverter is off-line, waiting to retry", self.name_prefix)
+        else:
+            _LOGGER.warning(
+                "%s Cloud timeout on Device Detail, will retry next poll.",
+                self.name_prefix,
+            )
+
+        # Reset the cycle counter so battery settings and daily gen are refreshed each hour.
+        if tslice >= TICK_CYCLE_LENGTH:
             tslice = RETRY_NEXT_SLOT
-        _LOGGER.debug("Auxilliary timeslice %s, %s", self.device_sn, tslice)
+        _LOGGER.debug("Poll tick complete %s, next tslice %s", self.device_sn, tslice)
 
         if self._last_hour != hournow:
             self._last_hour = hournow
 
         self._timeslice = tslice
-
         _LOGGER.debug(allData)
-
         return allData
 
 
@@ -445,6 +421,19 @@ def _build_entities(coordinator):
         FoxESSRunningState(coordinator, name, deviceID, "Running State", "running-state", "runningState"),
         FoxESSBatteryMode(coordinator, name, deviceID),
         FoxESSApiCallCount(coordinator, name, deviceID),
+        # EPS (Emergency Power Supply) sensors
+        FoxESSPower(coordinator, name, deviceID, "EPS Power", "eps-power", "epsPower"),
+        FoxESSCurrent(coordinator, name, deviceID, "EPS Current R", "eps-current-r", "epsCurrentR"),
+        FoxESSCurrent(coordinator, name, deviceID, "EPS Current S", "eps-current-s", "epsCurrentS"),
+        FoxESSCurrent(coordinator, name, deviceID, "EPS Current T", "eps-current-t", "epsCurrentT"),
+        FoxESSPower(coordinator, name, deviceID, "EPS Power R", "eps-power-r", "epsPowerR"),
+        FoxESSPower(coordinator, name, deviceID, "EPS Power S", "eps-power-s", "epsPowerS"),
+        FoxESSPower(coordinator, name, deviceID, "EPS Power T", "eps-power-t", "epsPowerT"),
+        FoxESSVolt(coordinator, name, deviceID, "EPS Volt R", "eps-volt-r", "epsVoltR"),
+        FoxESSVolt(coordinator, name, deviceID, "EPS Volt S", "eps-volt-s", "epsVoltS"),
+        FoxESSVolt(coordinator, name, deviceID, "EPS Volt T", "eps-volt-t", "epsVoltT"),
+        # Fault diagnostics
+        FoxESSFaultCount(coordinator, name, deviceID),
     ]
 
     if coordinator.ext_pv:
@@ -2179,6 +2168,26 @@ class FoxESSBatteryMode(FoxESSBaseEntity, SensorEntity):
     def native_value(self):
         if "workMode" in self.coordinator.data:
             return self.coordinator.data["workMode"]
+        return None
+
+
+class FoxESSFaultCount(FoxESSBaseEntity, SensorEntity):
+    _attr_state_class: SensorStateClass = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:alert-circle-outline"
+
+    def __init__(self, coordinator, name, deviceID):
+        super().__init__(coordinator=coordinator)
+        _LOGGER.debug("Initiating Entity - Fault Count")
+        self._attr_name = name + " - Fault Count"
+        self._attr_unique_id = deviceID + "fault-count"
+
+    @property
+    def native_value(self) -> int | None:
+        if self.coordinator.data["online"] and self.coordinator.data["raw"]:
+            if "currentFaultCount" not in self.coordinator.data["raw"]:
+                _LOGGER.debug("currentFaultCount None")
+            else:
+                return self.coordinator.data["raw"]["currentFaultCount"]
         return None
 
 

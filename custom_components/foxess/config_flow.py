@@ -26,7 +26,7 @@ CONF_RESTRICT = "Restrict"
 CONF_USE_V1_API = "Use_V1_Api"
 CONF_XTZONE = "xtZone"
 DEFAULT_NAME = "FoxESS"
-DEFAULT_REFRESH_INTERVAL = 1
+DEFAULT_REFRESH_INTERVAL = 5
 DEFAULT_USE_V1_API = True
 DEFAULT_VERIFY_SSL = False
 DEFAULT_TIMEOUT = 75
@@ -128,7 +128,7 @@ class FoxessConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Optional(
                     CONF_REFRESH_INTERVAL,
                     default=user_input.get(CONF_REFRESH_INTERVAL, DEFAULT_REFRESH_INTERVAL),
-                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=60)),
+                ): vol.All(vol.Coerce(int), vol.Range(min=1, max=30)),
                 vol.Optional(CONF_EXTPV, default=user_input.get(CONF_EXTPV, False)): bool,
                 vol.Optional(CONF_XTZONE, default=user_input.get(CONF_XTZONE, False)): bool,
                 vol.Optional(CONF_RESTRICT, default=user_input.get(CONF_RESTRICT, False)): bool,
