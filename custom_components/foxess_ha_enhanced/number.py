@@ -4,6 +4,7 @@ import json
 import logging
 
 from homeassistant.components.number import NumberEntity, NumberMode
+from homeassistant.components.rest.data import RestData
 from homeassistant.const import PERCENTAGE
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -13,16 +14,20 @@ from . import DOMAIN
 from .sensor import (
     DEFAULT_ENCODING,
     DEFAULT_TIMEOUT,
+    DEFAULT_USE_V1_API,
     DEFAULT_VERIFY_SSL,
     METHOD_POST,
     GetAuth,
     _ENDPOINT_OA_DOMAIN,
+    setScheduler,
     waitforAPI,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 _ENDPOINT_OA_BATTERY_SOC_SET = "/op/v0/device/battery/soc/set"
+_ENDPOINT_OA_SETTING_SET = "/op/v0/device/setting/set"
+_ENDPOINT_OA_SETTING_SET_V1 = "/op/v1/device/setting/set"
 
 
 async def setBatterySoC(hass, devicesn, apiKey, minSoc, minSocOnGrid, coordinator=None):
@@ -177,26 +182,276 @@ class FoxESSBatMinSoCOnGridNumber(CoordinatorEntity, NumberEntity):
         self.coordinator.async_set_updated_data(self.coordinator.data)
 
 
+async def setMaxCurrent(hass, devicesn, apiKey, key, value, coordinator=None):
+    """Write MaxChargeCurrent or MaxDischargeCurrent via the settings endpoint."""
+    await waitforAPI(coordinator)
+
+    v1_api = coordinator.v1_api if coordinator is not None else DEFAULT_USE_V1_API
+    path = _ENDPOINT_OA_SETTING_SET_V1 if v1_api else _ENDPOINT_OA_SETTING_SET
+    headerData = GetAuth().get_signature(token=apiKey, path=path)
+    payload = json.dumps({"sn": devicesn, "key": key, "value": str(value)})
+
+    rest = RestData(
+        hass,
+        METHOD_POST,
+        _ENDPOINT_OA_DOMAIN + path,
+        DEFAULT_ENCODING,
+        None,
+        headerData,
+        None,
+        payload,
+        DEFAULT_VERIFY_SSL,
+        SSLCipherList.PYTHON_DEFAULT,
+        DEFAULT_TIMEOUT,
+    )
+    await rest.async_update()
+    if not rest.data:
+        raise HomeAssistantError("FoxESS current setting update returned no data")
+
+    response = json.loads(rest.data)
+    if response.get("errno") != 0:
+        _LOGGER.error("FoxESS current setting update failed: %s", response)
+        raise HomeAssistantError("FoxESS current setting update failed")
+
+
+def _device_info(coordinator, deviceID):
+    from homeassistant.helpers.entity import DeviceInfo
+
+    info = DeviceInfo(
+        identifiers={(DOMAIN, deviceID)},
+        name=coordinator.name_prefix,
+        manufacturer="FoxESS",
+    )
+    if coordinator.data and "addressbook" in coordinator.data:
+        ab = coordinator.data["addressbook"]
+        model = ab.get("deviceType")
+        if model:
+            info["model"] = model
+        sw = ab.get("masterVersion")
+        if sw and sw != "not provided":
+            info["sw_version"] = sw
+    return info
+
+
+class FoxESSMaxChargeCurrentNumber(CoordinatorEntity, NumberEntity):
+    """Writable maximum battery charge current."""
+
+    _attr_native_min_value = 0
+    _attr_native_max_value = 100
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = "A"
+    _attr_mode = NumberMode.SLIDER
+    _attr_icon = "mdi:battery-charging-high"
+
+    def __init__(self, coordinator, name, deviceID, deviceSN, apiKey):
+        super().__init__(coordinator=coordinator)
+        self._attr_name = name + " - Max Charge Current"
+        self._attr_unique_id = deviceID + "max-charge-current-number"
+        self._deviceSN = deviceSN
+        self._apiKey = apiKey
+        self._deviceID = deviceID
+
+    @property
+    def device_info(self):
+        return _device_info(self.coordinator, self._deviceID)
+
+    @property
+    def native_value(self) -> float | None:
+        return self.coordinator.data.get("raw", {}).get("maxChargeCurrent")
+
+    async def async_set_native_value(self, value: float) -> None:
+        await setMaxCurrent(
+            self.hass, self._deviceSN, self._apiKey,
+            "MaxChargeCurrent", int(value), coordinator=self.coordinator,
+        )
+        self.coordinator.data["raw"]["maxChargeCurrent"] = int(value)
+        self.coordinator.async_set_updated_data(self.coordinator.data)
+
+
+class FoxESSMaxDischargeCurrentNumber(CoordinatorEntity, NumberEntity):
+    """Writable maximum battery discharge current."""
+
+    _attr_native_min_value = 0
+    _attr_native_max_value = 100
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = "A"
+    _attr_mode = NumberMode.SLIDER
+    _attr_icon = "mdi:battery-minus"
+
+    def __init__(self, coordinator, name, deviceID, deviceSN, apiKey):
+        super().__init__(coordinator=coordinator)
+        self._attr_name = name + " - Max Discharge Current"
+        self._attr_unique_id = deviceID + "max-discharge-current-number"
+        self._deviceSN = deviceSN
+        self._apiKey = apiKey
+        self._deviceID = deviceID
+
+    @property
+    def device_info(self):
+        return _device_info(self.coordinator, self._deviceID)
+
+    @property
+    def native_value(self) -> float | None:
+        return self.coordinator.data.get("raw", {}).get("maxDischargeCurrent")
+
+    async def async_set_native_value(self, value: float) -> None:
+        await setMaxCurrent(
+            self.hass, self._deviceSN, self._apiKey,
+            "MaxDischargeCurrent", int(value), coordinator=self.coordinator,
+        )
+        self.coordinator.data["raw"]["maxDischargeCurrent"] = int(value)
+        self.coordinator.async_set_updated_data(self.coordinator.data)
+
+
+class FoxESSSchedulerMinSoCNumber(CoordinatorEntity, NumberEntity):
+    """Writable per-period minimum SoC for the scheduler."""
+
+    _attr_native_min_value = 10
+    _attr_native_max_value = 100
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_mode = NumberMode.SLIDER
+    _attr_icon = "mdi:battery-low"
+
+    def __init__(self, coordinator, name, deviceID, deviceSN, apiKey, period: int):
+        super().__init__(coordinator=coordinator)
+        self._period = period
+        self._attr_name = f"{name} - Scheduler Period {period + 1} Min SoC"
+        self._attr_unique_id = f"{deviceID}scheduler-p{period + 1}-minsoc-number"
+        self._deviceSN = deviceSN
+        self._apiKey = apiKey
+        self._deviceID = deviceID
+
+    @property
+    def device_info(self):
+        return _device_info(self.coordinator, self._deviceID)
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.data.get("scheduler", {}).get("loaded", False)
+
+    @property
+    def native_value(self) -> float | None:
+        groups = self.coordinator.data.get("scheduler", {}).get("groups", [])
+        if self._period < len(groups):
+            return groups[self._period].get("minsoc")
+        return None
+
+    async def async_set_native_value(self, value: float) -> None:
+        groups = self.coordinator.data["scheduler"]["groups"]
+        groups[self._period]["minsoc"] = int(value)
+        await setScheduler(
+            self.hass, self._deviceSN, self._apiKey, groups, coordinator=self.coordinator,
+        )
+        self.coordinator.async_set_updated_data(self.coordinator.data)
+
+
+class FoxESSSchedulerMinSoCOnGridNumber(CoordinatorEntity, NumberEntity):
+    """Writable per-period minimum SoC on grid for the scheduler."""
+
+    _attr_native_min_value = 10
+    _attr_native_max_value = 100
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_mode = NumberMode.SLIDER
+    _attr_icon = "mdi:battery-low"
+
+    def __init__(self, coordinator, name, deviceID, deviceSN, apiKey, period: int):
+        super().__init__(coordinator=coordinator)
+        self._period = period
+        self._attr_name = f"{name} - Scheduler Period {period + 1} Min SoC on Grid"
+        self._attr_unique_id = f"{deviceID}scheduler-p{period + 1}-minsocongrid-number"
+        self._deviceSN = deviceSN
+        self._apiKey = apiKey
+        self._deviceID = deviceID
+
+    @property
+    def device_info(self):
+        return _device_info(self.coordinator, self._deviceID)
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.data.get("scheduler", {}).get("loaded", False)
+
+    @property
+    def native_value(self) -> float | None:
+        groups = self.coordinator.data.get("scheduler", {}).get("groups", [])
+        if self._period < len(groups):
+            return groups[self._period].get("minsocongrid")
+        return None
+
+    async def async_set_native_value(self, value: float) -> None:
+        groups = self.coordinator.data["scheduler"]["groups"]
+        groups[self._period]["minsocongrid"] = int(value)
+        await setScheduler(
+            self.hass, self._deviceSN, self._apiKey, groups, coordinator=self.coordinator,
+        )
+        self.coordinator.async_set_updated_data(self.coordinator.data)
+
+
+class FoxESSSchedulerFdSoCNumber(CoordinatorEntity, NumberEntity):
+    """Writable per-period force-discharge stop SoC for the scheduler."""
+
+    _attr_native_min_value = 10
+    _attr_native_max_value = 100
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_mode = NumberMode.SLIDER
+    _attr_icon = "mdi:battery-arrow-down"
+
+    def __init__(self, coordinator, name, deviceID, deviceSN, apiKey, period: int):
+        super().__init__(coordinator=coordinator)
+        self._period = period
+        self._attr_name = f"{name} - Scheduler Period {period + 1} Force Discharge SoC"
+        self._attr_unique_id = f"{deviceID}scheduler-p{period + 1}-fdsoc-number"
+        self._deviceSN = deviceSN
+        self._apiKey = apiKey
+        self._deviceID = deviceID
+
+    @property
+    def device_info(self):
+        return _device_info(self.coordinator, self._deviceID)
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.data.get("scheduler", {}).get("loaded", False)
+
+    @property
+    def native_value(self) -> float | None:
+        groups = self.coordinator.data.get("scheduler", {}).get("groups", [])
+        if self._period < len(groups):
+            return groups[self._period].get("fdsoc")
+        return None
+
+    async def async_set_native_value(self, value: float) -> None:
+        groups = self.coordinator.data["scheduler"]["groups"]
+        groups[self._period]["fdsoc"] = int(value)
+        await setScheduler(
+            self.hass, self._deviceSN, self._apiKey, groups, coordinator=self.coordinator,
+        )
+        self.coordinator.async_set_updated_data(self.coordinator.data)
+
+
 async def async_setup_entry(hass, entry, async_add_entities):
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(
-        [
-            FoxESSBatMinSoCNumber(
-                coordinator,
-                entry.data.get("name", coordinator.name_prefix),
-                entry.data["deviceID"],
-                entry.data["deviceSN"],
-                entry.data["apiKey"],
-            ),
-            FoxESSBatMinSoCOnGridNumber(
-                coordinator,
-                entry.data.get("name", coordinator.name_prefix),
-                entry.data["deviceID"],
-                entry.data["deviceSN"],
-                entry.data["apiKey"],
-            ),
-        ]
-    )
+    name = entry.data.get("name", coordinator.name_prefix)
+    device_id = entry.data["deviceID"]
+    device_sn = entry.data["deviceSN"]
+    api_key = entry.data["apiKey"]
+
+    entities = [
+        FoxESSBatMinSoCNumber(coordinator, name, device_id, device_sn, api_key),
+        FoxESSBatMinSoCOnGridNumber(coordinator, name, device_id, device_sn, api_key),
+        FoxESSMaxChargeCurrentNumber(coordinator, name, device_id, device_sn, api_key),
+        FoxESSMaxDischargeCurrentNumber(coordinator, name, device_id, device_sn, api_key),
+    ]
+    for i in range(3):
+        entities.extend([
+            FoxESSSchedulerMinSoCNumber(coordinator, name, device_id, device_sn, api_key, period=i),
+            FoxESSSchedulerMinSoCOnGridNumber(coordinator, name, device_id, device_sn, api_key, period=i),
+            FoxESSSchedulerFdSoCNumber(coordinator, name, device_id, device_sn, api_key, period=i),
+        ])
+    async_add_entities(entities)
 
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):

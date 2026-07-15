@@ -19,6 +19,7 @@ from .sensor import (
     METHOD_POST,
     GetAuth,
     _ENDPOINT_OA_DOMAIN,
+    setScheduler,
     waitforAPI,
 )
 
@@ -33,6 +34,15 @@ WORK_MODES = {
     "Feed-In": "Feedin",
     "Peak Shaving": "PeakShaving",
     "Scheduler": "Scheduler",
+}
+
+SCHEDULER_MODES = {
+    "Self-Use": "SelfUse",
+    "Feed-In": "Feedin",
+    "Backup": "Backup",
+    "Peak Shaving": "PeakShaving",
+    "Force Charge": "ForceCharge",
+    "Force Discharge": "ForceDischarge",
 }
 
 
@@ -125,19 +135,83 @@ async def setWorkMode(hass, devicesn, apiKey, mode, coordinator=None):
         coordinator.data.setdefault("raw", {})["ResponseTime"] = max(response_time, 0)
 
 
+def _device_info(coordinator, deviceID):
+    from homeassistant.helpers.entity import DeviceInfo
+
+    info = DeviceInfo(
+        identifiers={(DOMAIN, deviceID)},
+        name=coordinator.name_prefix,
+        manufacturer="FoxESS",
+    )
+    if coordinator.data and "addressbook" in coordinator.data:
+        ab = coordinator.data["addressbook"]
+        model = ab.get("deviceType")
+        if model:
+            info["model"] = model
+        sw = ab.get("masterVersion")
+        if sw and sw != "not provided":
+            info["sw_version"] = sw
+    return info
+
+
+class FoxESSSchedulerPeriodModeSelect(CoordinatorEntity, SelectEntity):
+    """Select the work mode for a scheduler time period."""
+
+    _attr_options = list(SCHEDULER_MODES.keys())
+    _attr_icon = "mdi:calendar-clock"
+
+    def __init__(self, coordinator, name, deviceID, deviceSN, apiKey, period: int):
+        super().__init__(coordinator=coordinator)
+        self._period = period
+        self._attr_name = f"{name} - Scheduler Period {period + 1} Mode"
+        self._attr_unique_id = f"{deviceID}scheduler-p{period + 1}-mode-select"
+        self._deviceSN = deviceSN
+        self._apiKey = apiKey
+        self._deviceID = deviceID
+
+    @property
+    def device_info(self):
+        return _device_info(self.coordinator, self._deviceID)
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.data.get("scheduler", {}).get("loaded", False)
+
+    @property
+    def current_option(self) -> str | None:
+        groups = self.coordinator.data.get("scheduler", {}).get("groups", [])
+        if self._period < len(groups):
+            api_val = groups[self._period].get("workMode")
+            for display, val in SCHEDULER_MODES.items():
+                if val == api_val:
+                    return display
+        return None
+
+    async def async_select_option(self, option: str) -> None:
+        api_value = SCHEDULER_MODES[option]
+        groups = self.coordinator.data["scheduler"]["groups"]
+        groups[self._period]["workMode"] = api_value
+        await setScheduler(
+            self.hass, self._deviceSN, self._apiKey, groups, coordinator=self.coordinator,
+        )
+        self.coordinator.async_set_updated_data(self.coordinator.data)
+
+
 async def async_setup_entry(hass, entry, async_add_entities):
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(
-        [
-            FoxESSWorkModeSelect(
-                coordinator,
-                entry.data.get("name", coordinator.name_prefix),
-                entry.data["deviceID"],
-                entry.data["deviceSN"],
-                entry.data["apiKey"],
-            )
-        ]
-    )
+    name = entry.data.get("name", coordinator.name_prefix)
+    device_id = entry.data["deviceID"]
+    device_sn = entry.data["deviceSN"]
+    api_key = entry.data["apiKey"]
+
+    entities = [
+        FoxESSWorkModeSelect(coordinator, name, device_id, device_sn, api_key),
+    ]
+    for i in range(3):
+        entities.append(
+            FoxESSSchedulerPeriodModeSelect(coordinator, name, device_id, device_sn, api_key, period=i)
+        )
+    async_add_entities(entities)
 
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):

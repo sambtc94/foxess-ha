@@ -4,7 +4,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 DOMAIN = "foxess_ha_enhanced"
-PLATFORMS = ["sensor", "select", "number"]
+PLATFORMS = ["sensor", "select", "number", "switch", "time"]
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
