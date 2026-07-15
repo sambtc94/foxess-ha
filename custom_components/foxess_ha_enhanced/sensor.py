@@ -828,7 +828,7 @@ async def getWorkMode(hass, allData, devicesn, apiKey, coordinator=None):
 
     restOAWorkMode = RestData(
         hass,
-        METHOD_GET,
+        METHOD_POST,
         _ENDPOINT_OA_DOMAIN + path,
         DEFAULT_ENCODING,
         None,

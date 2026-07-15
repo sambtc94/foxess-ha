@@ -112,6 +112,9 @@ async def setWorkMode(hass, devicesn, apiKey, mode, coordinator=None):
     timestamp = round(time.time() * 1000)
     await rest.async_update()
     if not rest.data:
+        if rest.last_exception is not None:
+            _LOGGER.error("FoxESS work mode update request failed: %s", rest.last_exception)
+            raise HomeAssistantError("FoxESS work mode update request failed") from rest.last_exception
         if v1_api:
             _LOGGER.debug("FoxESS work mode update returned no body on v1 API; assuming success")
             if coordinator is not None:
